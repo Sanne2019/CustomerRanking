@@ -1,6 +1,5 @@
 ﻿using CustomerRanking.Application.Iservice;
 using CustomerRanking.Common;
-using CustomerRanking.Common.Common;
 using CustomerRanking.Common.Constants;
 using CustomerRanking.Common.Extensions;
 using CustomerRanking.Contract.DTOs;
@@ -8,13 +7,13 @@ using CustomerRanking.Contract.DTOs;
 namespace CustomerRanking.Application.Service
 {
     /// <summary>
-    /// SortedSet + ReaderWriterLockSlim,the same with RankingSortSetService_LockSlim.cs
+    /// Skip List 
     /// </summary>
     public class RankingService : IRankingService
     {
-        private readonly Dictionary<long, CustomerDTO> _customers = new();
-        private readonly Dictionary<long, decimal> _customoer_Id_Score_Map = new();
-        private readonly SortedSet<(decimal score, long id)> _leaderBoard = new();
+        private readonly Dictionary<long, decimal> _customers = new();
+        private readonly Dictionary<long, decimal> _customerScores_Ranked = new();
+        private readonly RankedSkipListCustomer _skipListCustomer = new();
         private readonly ReaderWriterLockSlim _rwLock = new();
         public APIResponse UpdateScore(long customerId, decimal addScoreVal)
         {
@@ -28,50 +27,39 @@ namespace CustomerRanking.Application.Service
             }
             using (new WriterLock(_rwLock))
             {
-                if (!_customers.TryGetValue(customerId, out var customer))
+
+                if (!_customers.TryGetValue(customerId, out decimal currentScore))
                 {
-                    customer = new CustomerDTO();
-                    customer.CustomerId = customerId;
-                    customer.Score = addScoreVal;
-                    _customers.Add(customerId, customer);
+                    _customers.Add(customerId, addScoreVal);
                 }
                 else
                 {
-                    customer.Score += addScoreVal;
+                    _customers[customerId] = currentScore + addScoreVal;
                 }
-                if (_customoer_Id_Score_Map.TryGetValue(customerId, out var oldScore))
-                {
-                    var oldKey = CommonFunction.GetKey(oldScore, customerId);
-                    _leaderBoard.Remove(oldKey);
+                if (_customerScores_Ranked.TryGetValue(customerId, out var oldScore))
+                {// Only customers who are ranked need ranking updates, including delete operations
+                    _skipListCustomer.Delete(customerId, currentScore);
                 }
-
-                if (customer.Score > 0)
+                var newScore = _customers[customerId];
+                if (newScore > 0)
                 {//all customers whose score is greater than zero participate in a competition
-                    _customoer_Id_Score_Map[customerId] = customer.Score;
-
-                    var newKey = CommonFunction.GetKey(customer.Score, customer.CustomerId);
-                    _leaderBoard.Add(newKey);
+                    _customerScores_Ranked[customerId] = newScore;
+                    _skipListCustomer.Insert(customerId, newScore);
                 }
                 else
-                {
-                    _customoer_Id_Score_Map.Remove(customerId);
+                {// Remove from ranked dictionary if score is <= 0
+                    _customerScores_Ranked.Remove(customerId);
                 }
-                return APIResponse.Success(customer.Score);
+                return APIResponse.Success(newScore);
             }
         }
-
         public APIResponse GetCustomersByRank(int start, int end)
         {
-            if (start > end)
-            {
-                return APIResponse.Failure(ApplicationConstant.startLessEnd);
-            }
-            start = start < 1 ? 0 : start - 1;
-            end = end < 1 ? 0 : end - 1;
             using (new ReaderLock(_rwLock))
             {
-                var list = HandleData(start, end);
-                return APIResponse.Success(list);
+                var result = GetCustomersByRankNoLock(start, end);
+                return APIResponse.Success(result);
+
             }
         }
 
@@ -83,54 +71,56 @@ namespace CustomerRanking.Application.Service
             }
             high = high < 0 ? 0 : high;
             low = low < 0 ? 0 : low;
+
             using (new ReaderLock(_rwLock))
             {
-                if (!_customers.TryGetValue(customerId, out var customer))
+                if (!_customers.TryGetValue(customerId, out decimal customerScore))
                 {
                     return APIResponse.Failure(ApplicationConstant.customerNotFound);
                 }
 
-                if (!_customoer_Id_Score_Map.ContainsKey(customerId))
+                if (!_customerScores_Ranked.ContainsKey(customerId))
                 {
                     return APIResponse.Failure(ApplicationConstant.customerNotRanked);
                 }
 
-                int index = -1;
-                int i = 0;
-                foreach (var item in _leaderBoard)
-                {
-                    if (item.id == customerId)
-                    {
-                        index = i;
-                        break;
-                    }
-                    i++;
-                }
-
-                if (index == -1)
+                int rank = _skipListCustomer.GetRankById(customerId, customerScore);
+                if (rank == 0)
                 {
                     return APIResponse.Failure(ApplicationConstant.customerNotRanked);
                 }
-
-                var list = HandleData((index - high), (index + low));
-                return APIResponse.Success(list);
+                int start = Math.Max(1, rank - high);
+                int end = rank + low;
+                var result = GetCustomersByRankNoLock(start, end);
+                return APIResponse.Success(result);
             }
         }
-        private List<CustomerRankDTO> HandleData(int start, int end)
+
+
+        private List<CustomerRankDTO> GetCustomersByRankNoLock(int start, int end)
         {
-            var startIndex = Math.Max(0, start);
-            var endIndex = Math.Min(_leaderBoard.Count - 1, end);
-            var entries = _leaderBoard.Skip(startIndex).Take(endIndex - startIndex + 1).ToArray();
-            var list = new List<CustomerRankDTO>();
-            for (int i = 0; i < entries.Length; i++)
+            var result = new List<CustomerRankDTO>();
+            #region Step 1: Find the node at start position as start node
+            var startNode = _skipListCustomer.GetNodeByRank(start);
+            #endregion
+
+            #region Step 2: Traverse from start node, increment start rank each time, and reassign start node's next node to start node
+            // This continues until reaching end position, collecting all elements in between
+            int startRank = start;
+            while (startNode != null && startRank <= end)
             {
-                var id = entries[i].id;
-                if (_customers.TryGetValue(id, out var c))
+                result.Add(new CustomerRankDTO
                 {
-                    list.Add(new CustomerRankDTO { CustomerId = c.CustomerId, Score = c.Score, Rank = startIndex + 1 + i });
-                }
+                    CustomerId = startNode.CustomerId,
+                    Score = startNode.Score,
+                    Rank = startRank
+                });
+
+                startNode = startNode.NextArray[0];
+                startRank++;
             }
-            return list;
+            #endregion
+            return result;
         }
     }
 }
